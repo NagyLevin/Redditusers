@@ -15,9 +15,19 @@ DEFAULT_USERS = ["Levin"]  # just a test user so that the program doesn't crash
 DEFAULT_OUTDIR = "output"  # base output directory
 
 DEFAULT_USERFILE = "./users.txt"  # optional: default username list file
-VISITED_FILE = pathlib.Path("./visited_users.txt") # file to store the usernames that have been visited
-TIMEOUTS_FILE = pathlib.Path("./timeouts_users.txt") # file to store the usernames that have timed out so that we can download them again
+VISITED_FILE = pathlib.Path("./visited_users.txt")     # file to store the usernames that have been visited
+TIMEOUTS_FILE = pathlib.Path("./timeouts_users.txt")   # file to store the usernames that have timed out so that we can download them again
+
+# NEW: visited / new subs
+VISITED_SUBS_FILE = pathlib.Path("./visited_subs.txt")  # subredditek amiket skipelünk (post+comment)
+NEW_SUBS_FILE = pathlib.Path("./new_subs.txt")          # itt gyűjtjük az új subokat futás közben
 # ==============================
+
+
+# ---------- console logging ----------
+def log(msg: str) -> None:
+    # flush=True -> azonnal kiírja, nem bufferel
+    print(msg, flush=True)
 
 
 # ---------- visited / timeouts ----------
@@ -27,6 +37,7 @@ def _norm_user(name: str) -> str:
         name = name[2:]
     return name.lower()
 
+
 def add_to_visited(username: str) -> None:
     VISITED_FILE.touch(exist_ok=True)
     key = _norm_user(username)
@@ -35,10 +46,12 @@ def add_to_visited(username: str) -> None:
         with VISITED_FILE.open("a", encoding="utf-8") as f:
             f.write(key + "\n")
 
+
 def is_visited(username: str) -> bool:
     VISITED_FILE.touch(exist_ok=True)
     key = _norm_user(username)
     return key in {x.strip() for x in VISITED_FILE.read_text(encoding="utf-8", errors="ignore").splitlines() if x.strip()}
+
 
 def add_to_timeouts(username: str) -> None:
     TIMEOUTS_FILE.touch(exist_ok=True)
@@ -49,10 +62,60 @@ def add_to_timeouts(username: str) -> None:
             f.write(key + "\n")
 
 
+# ---------- subs helpers ----------
+def _norm_sub(name: str) -> str:
+    name = (name or "").strip()
+    if name.lower().startswith("r/"):
+        name = name[2:]
+    return name.lower()
+
+
+def load_visited_subs() -> set[str]:
+    """
+    visited_subs.txt format:
+      - egy subreddit soronként: pl. 'askreddit' vagy 'r/askreddit'
+      - üres sorok és # kommentek ignorálva
+    """
+    VISITED_SUBS_FILE.touch(exist_ok=True)
+    subs: set[str] = set()
+    for raw in VISITED_SUBS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        subs.add(_norm_sub(line))
+    return subs
+
+
+def load_existing_new_subs() -> set[str]:
+    NEW_SUBS_FILE.touch(exist_ok=True)
+    return {
+        _norm_sub(x.strip())
+        for x in NEW_SUBS_FILE.read_text(encoding="utf-8", errors="ignore").splitlines()
+        if x.strip() and (not x.strip().startswith("#"))
+    }
+
+
+def append_new_sub(sub_key: str, new_subs_seen: set[str]) -> None:
+    """
+    sub_key: normalizált (lower) subreddit név 'r/' nélkül
+    new_subs_seen: már kiírt new_sub-ok setje, hogy ne duplikáljunk
+    """
+    sub_key = _norm_sub(sub_key)
+    if not sub_key:
+        return
+    if sub_key in new_subs_seen:
+        return
+    NEW_SUBS_FILE.touch(exist_ok=True)
+    with NEW_SUBS_FILE.open("a", encoding="utf-8") as f:
+        f.write(sub_key + "\n")
+    new_subs_seen.add(sub_key)
+
+
 # ---------- helpers ----------
 def ensure_dir(p: str) -> None:
     if p:
         os.makedirs(p, exist_ok=True)
+
 
 def to_epoch(dt: Optional[str]) -> Optional[int]:
     """
@@ -72,6 +135,7 @@ def to_epoch(dt: Optional[str]) -> Optional[int]:
         return int(datetime.fromisoformat(dt).replace(tzinfo=timezone.utc).timestamp())
     return int(datetime.fromisoformat(dt + "T00:00:00").replace(tzinfo=timezone.utc).timestamp())
 
+
 def _safe_text(s: Optional[str]) -> str:
     if not s:
         return ""
@@ -79,11 +143,13 @@ def _safe_text(s: Optional[str]) -> str:
     lines = s.split("\n")
     return ("\n      ").join(lines)
 
+
 def _fmt_utc(ts: int) -> str:
     try:
         return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
     except Exception:
         return str(ts)
+
 
 def load_users_from_file(path: str) -> list[str]:
     """
@@ -114,9 +180,9 @@ def load_users_from_file(path: str) -> list[str]:
 # ---------- auth ----------
 def init_reddit() -> praw.Reddit:
     load_dotenv()
-    cid  = os.getenv("REDDIT_CLIENT_ID", "").strip()
+    cid = os.getenv("REDDIT_CLIENT_ID", "").strip()
     csec = os.getenv("REDDIT_CLIENT_SECRET", "").strip()
-    ua   = os.getenv("REDDIT_USER_AGENT", "").strip()
+    ua = os.getenv("REDDIT_USER_AGENT", "").strip()
 
     if not ua:
         raise RuntimeError("Missing REDDIT_USER_AGENT in .env")
@@ -134,10 +200,10 @@ def init_reddit() -> praw.Reddit:
             )
             r.read_only = True
             smoke_test(r)
-            print("[auth] OK: app-only (client_credentials)")
+            log("[auth] OK: app-only (client_credentials)")
             return r
         except Exception as e:
-            print("[auth] FAIL app-only:", repr(e))
+            log("[auth] FAIL app-only: " + repr(e))
 
     raise RuntimeError("Authentication error (check .env: REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT)")
 
@@ -160,13 +226,13 @@ def resolve_user(reddit: praw.Reddit, username: str):
         _ = u.id
         return u
     except NotFound:
-        print(f"[skip] u/{name} not found / deleted / suspended.")
+        log(f"[skip] u/{name} not found / deleted / suspended.")
     except Forbidden:
-        print(f"[skip] u/{name} forbidden (cannot access).")
+        log(f"[skip] u/{name} forbidden (cannot access).")
     except Redirect:
-        print(f"[skip] u/{name} redirected (invalid user).")
+        log(f"[skip] u/{name} redirected (invalid user).")
     except Exception as e:
-        print(f"[skip] u/{name} unknown error: {e!r}")
+        log(f"[skip] u/{name} unknown error: {e!r}")
     return None
 
 
@@ -184,6 +250,7 @@ def iter_user_posts(user, before: Optional[int], after: Optional[int], hard_limi
         if hard_limit and count >= hard_limit:
             break
 
+
 def iter_user_comments(user, before: Optional[int], after: Optional[int], hard_limit: Optional[int]) -> Iterable:
     count = 0
     for c in user.comments.new(limit=None):
@@ -200,43 +267,25 @@ def iter_user_comments(user, before: Optional[int], after: Optional[int], hard_l
 
 # ---------- writing ----------
 def write_post_block(f, s) -> None:
-    created = int(getattr(s, "created_utc", 0))
     title = getattr(s, "title", "") or ""
     subreddit = str(getattr(s, "subreddit", "")) or ""
-    url = getattr(s, "url", "") or ""
-    permalink = getattr(s, "permalink", "") or ""
     selftext = _safe_text(getattr(s, "selftext", None))
 
     f.write("Post:\n")
-    #f.write(f"  created_utc: {created} ({_fmt_utc(created)})\n") #nem kell mikor csinálták minden postnál
     f.write(f"  subreddit: r/{subreddit}\n")
     f.write(f"  title: {title}\n")
-    #if url:
-    #    f.write(f"  url: {url}\n") nem kell url
-    #if permalink:
-    #    f.write(f"  permalink: {permalink}\n")
     if selftext:
         f.write("  body:\n")
         f.write(f"    {selftext}\n")
     f.write("\n")
 
+
 def write_comment_block(f, c) -> None:
-    created = int(getattr(c, "created_utc", 0))
     subreddit = str(getattr(c, "subreddit", "")) or ""
     body = _safe_text(getattr(c, "body", None))
-    permalink = getattr(c, "permalink", "") or ""
-    link_id = getattr(c, "link_id", "") or ""
-    parent_id = getattr(c, "parent_id", "") or ""
 
     f.write("Comment:\n")
-    #f.write(f"  created_utc: {created} ({_fmt_utc(created)})\n") nem kell idő
     f.write(f"  subreddit: r/{subreddit}\n")
-    #if link_id:
-    #    f.write(f"  link_id: {link_id}\n")
-    #if parent_id:
-    #    f.write(f"  parent_id: {parent_id}\n")
-    #if permalink:
-    #    f.write(f"  permalink: {permalink}\n")
     if body:
         f.write("  body:\n")
         f.write(f"    {body}\n")
@@ -255,13 +304,25 @@ def download_user_activity(
     sleep_s: float = 0.5,
     include_posts: bool = True,
     include_comments: bool = True,
+    visited_subs: Optional[set[str]] = None,
+    new_subs_seen: Optional[set[str]] = None,
 ) -> None:
+    uname_key = _norm_user(username)
+    log(f"[start] Processing u/{uname_key}")
+
     user = resolve_user(reddit, username)
     if user is None:
+        log(f"[done]  Skipped u/{uname_key}")
         return
 
+    visited_subs = visited_subs or set()
+    new_subs_seen = new_subs_seen or set()
+
+    # csak egyszer írjuk ki userenként ugyanazt az üzenetet
+    logged_visited_subs: set[str] = set()
+    logged_new_subs: set[str] = set()
+
     ensure_dir(out_dir)
-    uname_key = _norm_user(username)  # for stable filenames
     posts_path = os.path.join(out_dir, f"{uname_key}_posts.txt")
     chats_path = os.path.join(out_dir, f"{uname_key}_chats.txt")
 
@@ -278,22 +339,58 @@ def download_user_activity(
             cmts_file.write(f"=== u/{uname_key} COMMENTS ===\n\n")
 
         if include_posts and posts_file:
+            log(f"[dl]   Downloading u/{uname_key} posts ...")
             pbar = tqdm(desc=f"Posts u/{uname_key}", unit="post")
             for s in iter_user_posts(user, before=before, after=after, hard_limit=limit_posts):
+                sub = str(getattr(s, "subreddit", "")) or ""
+                sub_key = _norm_sub(sub)
+
+                if sub_key in visited_subs:
+                    if sub_key not in logged_visited_subs:
+                        log(f"[skip] r/{sub_key} in visited_subs.txt, skipped (posts)")
+                        logged_visited_subs.add(sub_key)
+                    pbar.update(1)
+                    time.sleep(sleep_s)
+                    continue
+
+                if sub_key and (sub_key not in logged_new_subs):
+                    log(f"[new]  r/{sub_key}")
+                    logged_new_subs.add(sub_key)
+                    append_new_sub(sub_key, new_subs_seen)
+
                 write_post_block(posts_file, s)
                 posts_saved += 1
                 pbar.update(1)
                 time.sleep(sleep_s)
             pbar.close()
+            log(f"[dl]   Finished u/{uname_key} posts. Saved: {posts_saved} -> {posts_path}")
 
         if include_comments and cmts_file:
+            log(f"[dl]   Downloading u/{uname_key} comments ...")
             pbar = tqdm(desc=f"Comments u/{uname_key}", unit="comment")
             for c in iter_user_comments(user, before=before, after=after, hard_limit=limit_comments):
+                sub = str(getattr(c, "subreddit", "")) or ""
+                sub_key = _norm_sub(sub)
+
+                if sub_key in visited_subs:
+                    if sub_key not in logged_visited_subs:
+                        log(f"[skip] r/{sub_key} in visited_subs.txt, skipped (comments)")
+                        logged_visited_subs.add(sub_key)
+                    pbar.update(1)
+                    time.sleep(sleep_s)
+                    continue
+
+                if sub_key and (sub_key not in logged_new_subs):
+                    log(f"[new]  r/{sub_key}")
+                    logged_new_subs.add(sub_key)
+                    append_new_sub(sub_key, new_subs_seen)
+
                 write_comment_block(cmts_file, c)
                 cmts_saved += 1
                 pbar.update(1)
                 time.sleep(sleep_s)
             pbar.close()
+            log(f"[dl]   Finished u/{uname_key} comments. Saved: {cmts_saved} -> {chats_path}")
 
     finally:
         if posts_file:
@@ -303,86 +400,75 @@ def download_user_activity(
             cmts_file.flush()
             cmts_file.close()
 
-    if include_posts:
-        print(f" Saved: {posts_saved} posts    -> {posts_path}")
-    if include_comments:
-        print(f" Saved: {cmts_saved} comments -> {chats_path}")
+    log(f"[done] Completed u/{uname_key}")
 
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Reddit user downloader (all posts + comments via PRAW)")  # Parancssori argumentumok kezelése (CLI), a program leírásával
+        description="Reddit user downloader (all posts + comments via PRAW)")
 
     ap.add_argument(
         "username",
         nargs="*",
-        help="e.g. spez (you can pass multiple separated by space)")  # Opcionális pozicionális lista: ha megadsz userneveket (többet is), ezeket dolgozza fel.
-   # Ha üresen hagyod, akkor a program az alapértelmezett listát / input fájlt használja.
+        help="e.g. spez (you can pass multiple separated by space)")
 
     ap.add_argument(
         "--out",
         default=None,
-        help="output directory (default: DEFAULT_OUTDIR)")  # Kimeneti mappa megadása. Ha nem adod meg, akkor a DEFAULT_OUTDIR lesz használva.
+        help="output directory (default: DEFAULT_OUTDIR)")
 
     ap.add_argument(
         "--after",
         help="lower time bound (epoch or ISO e.g., 2024-01-01)",
-        default=None)  # Alsó időhatár (mettől): csak az ennél újabb bejegyzéseket/kommenteket gyűjti.
-   # Elfogad epoch másodpercet (pl. 1722575400) vagy ISO dátumot (pl. 2024-01-01 vagy 2024-01-01T12:30:00).
+        default=None)
 
     ap.add_argument(
         "--before",
         help="upper time bound (epoch or ISO)",
-        default=None)  # Felső időhatár (meddig): csak az ennél régebbi (vagy nem frissebb) elemeket gyűjti.
-   # Ugyanúgy epoch vagy ISO formátum.
+        default=None)
 
     ap.add_argument(
         "--limit-posts",
         type=int,
         default=None,
-        help="max number of posts per user (None = unlimited)")  # Maximum ennyi posztot gyűjt 1 usertől. Ha nincs megadva, akkor nincs limit (amennyit az API enged).
+        help="max number of posts per user (None = unlimited)")
 
     ap.add_argument(
         "--limit-comments",
         type=int,
         default=None,
-        help="max number of comments per user (None = unlimited)")  # Maximum ennyi kommentet gyűjt 1 usertől. Ha nincs megadva, akkor nincs limit.
+        help="max number of comments per user (None = unlimited)")
 
     ap.add_argument(
         "--no-posts",
         action="store_true",
-        help="skip posts")  # Ha ezt megadod, akkor a program NEM gyűjti a posztokat (csak kommenteket, ha az nincs tiltva).
+        help="skip posts")
 
     ap.add_argument(
         "--no-comments",
         action="store_true",
-        help="skip comments")  # Ha ezt megadod, akkor a program NEM gyűjti a kommenteket (csak posztokat, ha az nincs tiltva).
+        help="skip comments")
 
     ap.add_argument(
         "--sleep",
         type=float,
         default=0.5,
-        help="sleep between items (seconds)")  # Két lekérés/elem feldolgozása között ennyi másodpercet vár.
-   # Ez segít elkerülni a rate limitet ne terheljük tul az APIt
+        help="sleep between items (seconds)")
 
     ap.add_argument(
         "--auth-test",
         action="store_true",
-        help="only test authentication and exit")  # Csak ellenőrzi, hogy működik-e az authentikáció (.env beállítások jók-e), majd kilép.
-   # Hasznos gyors teszthez letöltés nélkül.
+        help="only test authentication and exit")
 
     ap.add_argument(
         "--inputfile",
         default=None,
-        help="path to a text file listing usernames (one per line)")  # Ha megadod, akkor innen olvassa a userneveket (1 sor = 1 username).
-   # Ilyenkor a CLI-ben megadott "username" lista helyett ezt használja (a kódod logikájától függően).
+        help="path to a text file listing usernames (one per line)")
 
     ap.add_argument(
         "--reset-visited",
         action="store_true",
-        help="ignore visited_users.txt and start fresh (this run)")  # Ha megadod, akkor a program figyelmen kívül hagyja a visited_users.txt-t,
-   # tehát újra feldolgozza azokat a usereket is, akiket korábban már feldolgozott (azért hogy idő elteltével újra lehessen gyűjteni az adatokat).
-
+        help="ignore visited_users.txt and start fresh (this run)")
 
     args = ap.parse_args()
     after = to_epoch(args.after)
@@ -390,8 +476,14 @@ def main():
 
     reddit = init_reddit()
     if args.auth_test:
-        print("[auth] smoke test successful – exiting (--auth-test)")
+        log("[auth] smoke test successful – exiting (--auth-test)")
         return
+
+    # NEW: load visited subs + existing new_subs cache
+    visited_subs = load_visited_subs()
+    new_subs_seen = load_existing_new_subs()
+    log(f"[info] Loaded {len(visited_subs)} visited sub(s) from {VISITED_SUBS_FILE}")
+    log(f"[info] Loaded {len(new_subs_seen)} already-known new sub(s) from {NEW_SUBS_FILE}")
 
     # Load usernames
     if args.inputfile:
@@ -400,7 +492,7 @@ def main():
         if not os.path.isabs(inpath):
             inpath = os.path.join(base_dir, inpath)
         users = load_users_from_file(inpath)
-        print(f"[info] Loaded {len(users)} usernames from {inpath}")
+        log(f"[info] Loaded {len(users)} usernames from {inpath}")
     else:
         users = args.username if args.username else DEFAULT_USERS
 
@@ -408,19 +500,21 @@ def main():
 
     # reset visited for this run
     if args.reset_visited and VISITED_FILE.exists():
-        # do NOT delete file, just ignore it by renaming (safer)
-        # if you prefer hard delete: VISITED_FILE.unlink()
-        print("[info] --reset-visited enabled: ignoring visited_users.txt for this run")
+        log("[info] --reset-visited enabled: ignoring visited_users.txt for this run")
         visited_override = True
     else:
         visited_override = False
 
-    for u in users:
+    total = len(users)
+    for i, u in enumerate(users, start=1):
         if not u.strip():
             continue
 
+        uname_key = _norm_user(u)
+        log(f"\n=== [{i}/{total}] Queue: u/{uname_key} ===")
+
         if (not visited_override) and is_visited(u):
-            print(f"Already processed u/{_norm_user(u)}")
+            log(f"[skip] Already processed u/{uname_key}")
             continue
 
         try:
@@ -435,11 +529,13 @@ def main():
                 sleep_s=args.sleep,
                 include_posts=(not args.no_posts),
                 include_comments=(not args.no_comments),
+                visited_subs=visited_subs,
+                new_subs_seen=new_subs_seen,
             )
             add_to_visited(u)
 
         except Exception as e:
-            print(f"[ABORT USER] u/{_norm_user(u)} due to failure: {e}")
+            log(f"[ABORT USER] u/{uname_key} due to failure: {e!r}")
             add_to_timeouts(u)
             continue
 
