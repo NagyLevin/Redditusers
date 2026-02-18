@@ -1,3 +1,6 @@
 praw
 python-dotenv
 tqdm
+langdetect
+phunspell
+regex

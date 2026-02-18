@@ -1,8 +1,9 @@
 import os
+import re
 import time
 import argparse
 from datetime import datetime, timezone
-from typing import Optional, Iterable
+from typing import Optional, Iterable, Tuple
 
 import praw
 from prawcore import NotFound, Forbidden, Redirect
@@ -18,7 +19,7 @@ DEFAULT_USERFILE = "./users.txt"  # optional: default username list file
 VISITED_FILE = pathlib.Path("./visited_users.txt")     # file to store the usernames that have been visited
 TIMEOUTS_FILE = pathlib.Path("./timeouts_users.txt")   # file to store the usernames that have timed out so that we can download them again
 
-# NEW: visited / new subs
+# visited / new subs
 VISITED_SUBS_FILE = pathlib.Path("./visited_subs.txt")  # subredditek amiket skipelünk (post+comment)
 NEW_SUBS_FILE = pathlib.Path("./new_subs.txt")          # itt gyűjtjük az új subokat futás közben
 # ==============================
@@ -26,7 +27,6 @@ NEW_SUBS_FILE = pathlib.Path("./new_subs.txt")          # itt gyűjtjük az új 
 
 # ---------- console logging ----------
 def log(msg: str) -> None:
-    # flush=True -> azonnal kiírja, nem bufferel
     print(msg, flush=True)
 
 
@@ -222,8 +222,7 @@ def resolve_user(reddit: praw.Reddit, username: str):
 
     u = reddit.redditor(name)
     try:
-        # Force fetch
-        _ = u.id
+        _ = u.id  # Force fetch
         return u
     except NotFound:
         log(f"[skip] u/{name} not found / deleted / suspended.")
@@ -292,6 +291,129 @@ def write_comment_block(f, c) -> None:
     f.write("\n")
 
 
+# ---------- HU filter (langdetect + phunspell) ----------
+_WORD_RE = re.compile(r"[A-Za-zÁÉÍÓÖŐÚÜŰáéíóöőúüű]+")
+
+
+def init_langdetect():
+    """
+    Returns (detect_langs_func, ok_bool).
+    """
+    try:
+        from langdetect import detect_langs, DetectorFactory
+        DetectorFactory.seed = 0
+        return detect_langs, True
+    except Exception as e:
+        log(f"[warn] langdetect not available: {e!r}")
+        return None, False
+
+
+def init_hunspell_hu():
+    """
+    Returns (hunspell_obj, ok_bool).
+    Needs Hungarian dictionary (.aff/.dic). We try:
+      - env: HUNSPELL_AFF + HUNSPELL_DIC
+      - common linux paths
+    """
+    try:
+        from phunspell import HunSpell
+    except Exception as e:
+        log(f"[warn] phunspell not available: {e!r}")
+        return None, False
+
+    env_aff = os.getenv("HUNSPELL_AFF", "").strip()
+    env_dic = os.getenv("HUNSPELL_DIC", "").strip()
+    candidates = []
+
+    if env_aff and env_dic:
+        candidates.append((env_aff, env_dic))
+
+    candidates += [
+        ("/usr/share/hunspell/hu_HU.aff", "/usr/share/hunspell/hu_HU.dic"),
+        ("/usr/share/myspell/dicts/hu_HU.aff", "/usr/share/myspell/dicts/hu_HU.dic"),
+        ("/usr/share/myspell/hu_HU.aff", "/usr/share/myspell/hu_HU.dic"),
+    ]
+
+    for aff, dic in candidates:
+        try:
+            if os.path.exists(aff) and os.path.exists(dic):
+                hs = HunSpell(dic, aff)  # phunspell: HunSpell(dic_path, aff_path)
+                log(f"[lang] phunspell OK: {dic} + {aff}")
+                return hs, True
+        except Exception as e:
+            log(f"[warn] phunspell init failed for {dic} / {aff}: {e!r}")
+
+    log("[warn] phunspell available, but Hungarian dictionary not found. "
+        "Set HUNSPELL_AFF and HUNSPELL_DIC env vars, or install hu_HU hunspell dict.")
+    return None, False
+
+
+def langdetect_hu_score(text: str, detect_langs_func) -> Optional[float]:
+    if not detect_langs_func:
+        return None
+    t = (text or "").strip()
+    if len(t) < 15:
+        return 0.0
+    try:
+        langs = detect_langs_func(t)
+        # langs: [hu:0.87, en:0.13] ...
+        for lp in langs:
+            if getattr(lp, "lang", None) == "hu":
+                return float(getattr(lp, "prob", 0.0))
+        return 0.0
+    except Exception:
+        return 0.0
+
+
+def hunspell_hu_score(text: str, hunspell_obj) -> Optional[float]:
+    if hunspell_obj is None:
+        return None
+    t = (text or "").strip()
+    if not t:
+        return 0.0
+
+    words = _WORD_RE.findall(t)
+    words = [w.lower() for w in words if len(w) >= 2]
+    if len(words) < 5:
+        return 0.0
+
+    ok = 0
+    total = 0
+    for w in words[:400]:  # safety cap
+        total += 1
+        try:
+            if hunspell_obj.spell(w):
+                ok += 1
+        except Exception:
+            # if spell fails, ignore that word from ratio
+            total -= 1
+
+    if total <= 0:
+        return 0.0
+    return ok / total
+
+
+def is_hungarian(text: str, threshold: float, detect_langs_func, hunspell_obj) -> Tuple[bool, float, float]:
+    """
+    Returns: (is_hu, langdetect_score, hunspell_score)
+    If a detector is unavailable -> score = -1.0
+    Rule: keep if (langdetect_score >= threshold) OR (hunspell_score >= threshold)
+    """
+    ld = langdetect_hu_score(text, detect_langs_func)
+    hs = hunspell_hu_score(text, hunspell_obj)
+
+    ld_score = float(ld) if ld is not None else -1.0
+    hs_score = float(hs) if hs is not None else -1.0
+
+    keep = False
+    if ld is not None and ld >= threshold:
+        keep = True
+    if hs is not None and hs >= threshold:
+        keep = True
+
+    return keep, ld_score, hs_score
+
+
 # ---------- main download ----------
 def download_user_activity(
     reddit: praw.Reddit,
@@ -306,6 +428,9 @@ def download_user_activity(
     include_comments: bool = True,
     visited_subs: Optional[set[str]] = None,
     new_subs_seen: Optional[set[str]] = None,
+    hu_threshold: Optional[float] = None,
+    detect_langs_func=None,
+    hunspell_obj=None,
 ) -> None:
     uname_key = _norm_user(username)
     log(f"[start] Processing u/{uname_key}")
@@ -321,6 +446,7 @@ def download_user_activity(
     # csak egyszer írjuk ki userenként ugyanazt az üzenetet
     logged_visited_subs: set[str] = set()
     logged_new_subs: set[str] = set()
+    logged_filter_skips: int = 0  # ne spameljen végtelenül
 
     ensure_dir(out_dir)
     posts_path = os.path.join(out_dir, f"{uname_key}_posts.txt")
@@ -345,6 +471,7 @@ def download_user_activity(
                 sub = str(getattr(s, "subreddit", "")) or ""
                 sub_key = _norm_sub(sub)
 
+                # visited subs -> skip
                 if sub_key in visited_subs:
                     if sub_key not in logged_visited_subs:
                         log(f"[skip] r/{sub_key} in visited_subs.txt, skipped (posts)")
@@ -353,6 +480,22 @@ def download_user_activity(
                     time.sleep(sleep_s)
                     continue
 
+                # HU filter
+                if hu_threshold is not None:
+                    title = getattr(s, "title", "") or ""
+                    selftext = getattr(s, "selftext", "") or ""
+                    text = (title + "\n" + selftext).strip()
+
+                    keep, ld_score, hs_score = is_hungarian(text, hu_threshold, detect_langs_func, hunspell_obj)
+                    if not keep:
+                        if logged_filter_skips < 5:
+                            log(f"[skip] r/{sub_key} not HU enough (posts) ld={ld_score:.3f} hs={hs_score:.3f}")
+                            logged_filter_skips += 1
+                        pbar.update(1)
+                        time.sleep(sleep_s)
+                        continue
+
+                # new sub only if we actually keep an item from it
                 if sub_key and (sub_key not in logged_new_subs):
                     log(f"[new]  r/{sub_key}")
                     logged_new_subs.add(sub_key)
@@ -362,6 +505,7 @@ def download_user_activity(
                 posts_saved += 1
                 pbar.update(1)
                 time.sleep(sleep_s)
+
             pbar.close()
             log(f"[dl]   Finished u/{uname_key} posts. Saved: {posts_saved} -> {posts_path}")
 
@@ -372,6 +516,7 @@ def download_user_activity(
                 sub = str(getattr(c, "subreddit", "")) or ""
                 sub_key = _norm_sub(sub)
 
+                # visited subs -> skip
                 if sub_key in visited_subs:
                     if sub_key not in logged_visited_subs:
                         log(f"[skip] r/{sub_key} in visited_subs.txt, skipped (comments)")
@@ -380,6 +525,21 @@ def download_user_activity(
                     time.sleep(sleep_s)
                     continue
 
+                # HU filter
+                if hu_threshold is not None:
+                    body = getattr(c, "body", "") or ""
+                    text = body.strip()
+
+                    keep, ld_score, hs_score = is_hungarian(text, hu_threshold, detect_langs_func, hunspell_obj)
+                    if not keep:
+                        if logged_filter_skips < 5:
+                            log(f"[skip] r/{sub_key} not HU enough (comments) ld={ld_score:.3f} hs={hs_score:.3f}")
+                            logged_filter_skips += 1
+                        pbar.update(1)
+                        time.sleep(sleep_s)
+                        continue
+
+                # new sub only if we actually keep an item from it
                 if sub_key and (sub_key not in logged_new_subs):
                     log(f"[new]  r/{sub_key}")
                     logged_new_subs.add(sub_key)
@@ -389,6 +549,7 @@ def download_user_activity(
                 cmts_saved += 1
                 pbar.update(1)
                 time.sleep(sleep_s)
+
             pbar.close()
             log(f"[dl]   Finished u/{uname_key} comments. Saved: {cmts_saved} -> {chats_path}")
 
@@ -470,6 +631,13 @@ def main():
         action="store_true",
         help="ignore visited_users.txt and start fresh (this run)")
 
+    ap.add_argument(
+        "--filterhu",
+        type=float,
+        default=None,
+        help="Hungarian filter threshold (0..1). Keep item if langdetect OR phunspell >= threshold. Example: --filterhu 0.4",
+    )
+
     args = ap.parse_args()
     after = to_epoch(args.after)
     before = to_epoch(args.before)
@@ -479,11 +647,33 @@ def main():
         log("[auth] smoke test successful – exiting (--auth-test)")
         return
 
-    # NEW: load visited subs + existing new_subs cache
+    # Load visited subs + new_subs cache
     visited_subs = load_visited_subs()
     new_subs_seen = load_existing_new_subs()
     log(f"[info] Loaded {len(visited_subs)} visited sub(s) from {VISITED_SUBS_FILE}")
     log(f"[info] Loaded {len(new_subs_seen)} already-known new sub(s) from {NEW_SUBS_FILE}")
+
+    # HU filter init (only if requested)
+    hu_threshold: Optional[float] = args.filterhu
+    detect_langs_func = None
+    hunspell_obj = None
+
+    if hu_threshold is not None:
+        if hu_threshold < 0.0 or hu_threshold > 1.0:
+            raise RuntimeError("--filterhu must be between 0.0 and 1.0")
+
+        detect_langs_func, ld_ok = init_langdetect()
+        hunspell_obj, hs_ok = init_hunspell_hu()
+
+        if not ld_ok and not hs_ok:
+            raise RuntimeError(
+                "HU filter requested but neither langdetect nor phunspell is usable.\n"
+                "Install: pip install langdetect phunspell\n"
+                "For phunspell you also need Hungarian hunspell dictionaries (hu_HU.aff + hu_HU.dic),\n"
+                "or set env vars: HUNSPELL_AFF and HUNSPELL_DIC."
+            )
+
+        log(f"[lang] HU filter enabled: threshold={hu_threshold} (langdetect={'OK' if ld_ok else 'NO'}, phunspell={'OK' if hs_ok else 'NO'})")
 
     # Load usernames
     if args.inputfile:
@@ -531,6 +721,9 @@ def main():
                 include_comments=(not args.no_comments),
                 visited_subs=visited_subs,
                 new_subs_seen=new_subs_seen,
+                hu_threshold=hu_threshold,
+                detect_langs_func=detect_langs_func,
+                hunspell_obj=hunspell_obj,
             )
             add_to_visited(u)
 
@@ -542,3 +735,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+#TODO try on szerver after subreddits are all done last used command:  python main.py --inputfile musers.txt --sleep 0.1 --filterhu 0.5
