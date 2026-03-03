@@ -440,12 +440,14 @@ def download_user_activity(
         log(f"[done]  Skipped u/{uname_key}")
         return
 
-    visited_subs = visited_subs or set()
-    new_subs_seen = new_subs_seen or set()
+    # FIX: ne használj "or set()" mintát, mert az üres set-et is lecseréli egy újra
+    if visited_subs is None:
+        visited_subs = set()
+    if new_subs_seen is None:
+        new_subs_seen = set()
 
     # csak egyszer írjuk ki userenként ugyanazt az üzenetet
     logged_visited_subs: set[str] = set()
-    logged_new_subs: set[str] = set()
     logged_filter_skips: int = 0  # ne spameljen végtelenül
 
     ensure_dir(out_dir)
@@ -495,10 +497,11 @@ def download_user_activity(
                         time.sleep(sleep_s)
                         continue
 
-                # new sub only if we actually keep an item from it
-                if sub_key and (sub_key not in logged_new_subs):
+                # FIX: new_subs.txt-be csak akkor, ha:
+                #  - ezt az elemet tényleg megtartjuk (eddig eljutottunk)
+                #  - és még nincs benne a new_subs_seen (ami a file tartalmát is tükrözi)
+                if sub_key and (sub_key not in new_subs_seen):
                     log(f"[new]  r/{sub_key}")
-                    logged_new_subs.add(sub_key)
                     append_new_sub(sub_key, new_subs_seen)
 
                 write_post_block(posts_file, s)
@@ -539,10 +542,9 @@ def download_user_activity(
                         time.sleep(sleep_s)
                         continue
 
-                # new sub only if we actually keep an item from it
-                if sub_key and (sub_key not in logged_new_subs):
+                # FIX: ugyanaz a szabály kommenteknél is
+                if sub_key and (sub_key not in new_subs_seen):
                     log(f"[new]  r/{sub_key}")
-                    logged_new_subs.add(sub_key)
                     append_new_sub(sub_key, new_subs_seen)
 
                 write_comment_block(cmts_file, c)
@@ -720,10 +722,10 @@ def main():
                 include_posts=(not args.no_posts),
                 include_comments=(not args.no_comments),
                 visited_subs=visited_subs,
-                new_subs_seen=new_subs_seen,
+                new_subs_seen=new_subs_seen,  # ugyanazt a set-et visszük végig futás közben
                 hu_threshold=hu_threshold,
                 detect_langs_func=detect_langs_func,
-                hunspell_obj=hunspell_obj,
+                hunspell_obj=huntspell_obj if False else hunspell_obj,  # no-op: keep variable name unchanged
             )
             add_to_visited(u)
 
@@ -735,5 +737,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
 #TODO try on szerver after subreddits are all done last used command:  python main.py --inputfile musers.txt --sleep 0.1 --filterhu 0.5
