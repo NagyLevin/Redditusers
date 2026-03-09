@@ -1,0 +1,211 @@
+== Reddit felhasználó komment és post letöltő 
+
+Ez az eszköz egy vagy több Reddit felhasználó **összes posztját és kommentjét** tölti le a Reddit API-n keresztül (PRAW használatával), és szöveges (`.txt`) fájlokba menti.
+
+- **Posztok**: `output/<felhasználónév>_posts.txt`
+- **Kommentek**: `output/<felhasználónév>_chats.txt`
+
+Emellett:
+
+- `visited_users.txt`: már feldolgozott felhasználónevek (következő futásoknál skip)
+- `timeouts_users.txt`: olyan felhasználók, akiknél hiba volt
+- `visited_subs.txt`: olyan subredditek, amelyeket **ki kell hagyni mert már letöltöttük a tartalmukat a reddit letöltővel** 
+- `new_subs.txt`: futás közben talált **új subredditek** listája
+
+== Előfeltételek
+
+
+[source,bash]
+----
+# szükséges csomagok (példa a requirements.txt-ben):
+# praw
+# python-dotenv
+# tqdm
+# langdetect    # csak ha használod a --filterhu opciót
+# phunspell     # csak ha használod a --filterhu opciót
+
+pip install -r requirements.txt
+----
+
+A szükséges Python csomagokat a projekt gyökerében lévő `requirements.txt` alapján lehez telepíteni a fenti paranccsal.
+
+=== Reddit API hitelesítés (.env)
+
+A script a PRAW-t **app-only** módban használja. A projekt gyökerében legyen egy `.env` fájl az alábbi kulcsokkal:
+
+[source]
+----
+REDDIT_CLIENT_ID=...
+REDDIT_CLIENT_SECRET=...
+REDDIT_USER_AGENT=valami-rovid-leiras-a-kliensedrol
+----
+
+- `REDDIT_USER_AGENT` **kötelező** (nélküle azonnal hibát dob).
+- Ha `CLIENT_ID` vagy `CLIENT_SECRET` hibás/hiányzik, a program "Authentication error" hibával leáll.
+
+=== Magyar hunspell szótár (opcionális, csak --filterhu-hoz)
+
+Ha használod a `--filterhu` opciót, akkor a program megpróbál kétféle szűrést:
+
+- `langdetect` (általános nyelvfelismerés)
+- `phunspell` magyar helyesírás-ellenőrzés
+
+A `phunspell` működéséhez szükség van a magyar hunspell szótárfájlokra (`hu_HU.aff`, `hu_HU.dic`). A program ezeket próbálja:
+
+- környezeti változókból: `HUNSPELL_AFF`, `HUNSPELL_DIC`
+- tipikus Linux elérési utakból: `/usr/share/hunspell/...`, `/usr/share/myspell/...`
+
+Ha se `langdetect`, se `phunspell` nem használható, de megadtál `--filterhu`-t, akkor hibaüzenettel leáll.
+
+== Fájlok és állományok
+
+- `main.py`: a fő program, CLI-vel.
+- `visited_users.txt`: egy felhasználónevet tartalmaz soronként; ezeket a következő futáskor **nem** dolgozza fel (kivéve, ha `--reset-visited`).
+- `timeouts_users.txt`: olyan userek, akiknél hiba történt; jelzés, hogy később újra érdemes lehet próbálni.
+- `visited_subs.txt`:
+  * formátum: soronként egy subreddit, pl. `askreddit` vagy `r/askreddit`
+  * üres sorok és `#`-szal kezdődő sorok kommentként ignorálva
+  * ezekből a subokból **nem tölt le** sem posztot, sem kommentet
+- `new_subs.txt`:
+  * ide írja az összes **újonnan észlelt** subot, amely nem szerepel `visited_subs.txt`-ben
+  * minden subs csak egyszer kerül be (futáson belül + korábban már létező fájl alapján)
+- `users.txt` vagy más input fájl:
+  * soronként egy Reddit felhasználónév
+  * `#`-szal kezdődő sorok kommentek
+  * opcionálisan `u/<név>` formátum is használható; ez automatikusan normalizálva lesz
+
+== Használat
+
+Alap parancs:
+
+[source,bash]
+----
+python main.py 
+----
+
+Ha nem adsz meg felhasználónevet, akkor a kódban definiált `DEFAULT_USERS` listát használja (jelenleg csak `Levin`).
+
+=== Főbb argumentumok
+
+- `username` (pozícionális, 0..n darab):
+  * Reddit felhasználónevek (szóközzel elválasztva)
+  * pl. `python main.py spez levin`
+
+- `--out`:
+  * kimeneti könyvtár
+  * alapértelmezés: `output`
+
+- `--after`:
+  * alsó időhatár
+  * formátumok:
+    ** epoch (pl. `1722575400`)
+    ** ISO dátum: `2024-01-01` (UTC 00:00:00)
+    ** ISO dátum-idő: `2024-01-01T14:30:00` (UTC)
+
+- `--before`:
+  * felső időhatár (ugyanazok a formátumok, mint `--after`-nél)
+
+- `--limit-posts`:
+  * max. posztok száma **felhasználónként**
+  * `None` (alapértelmezés) = nincs limit
+
+- `--limit-comments`:
+  * max. kommentek száma **felhasználónként**
+  * `None` (alapértelmezés) = nincs limit
+
+- `--no-posts`:
+  * ha megadod, **nem** tölt le posztokat, csak kommenteket
+
+- `--no-comments`:
+  * ha megadod, **nem** tölt le kommenteket, csak posztokat
+
+- `--sleep`:
+  * várakozás (másodperc) két letöltött elem között
+  * alapértelmezés: `0.5`
+  * ha gyorsítani szeretnél, csökkentheted (pl. `0.1`), de vedd figyelembe a Reddit rate limitet
+
+- `--auth-test`:
+  * csak **auth teszt**: lefuttat egy rövid smoke testet a Reddit API-n, majd kilép
+  * hasznos a `.env` és a PRAW beállítások ellenőrzésére
+
+- `--inputfile`:
+  * felhasználónevek listája egy szövegfájlban (soronként egy név)
+  * relatív útvonal esetén a script könyvtára lesz az alap
+  * pl. `--inputfile users.txt`
+
+- `--reset-visited`:
+  * az aktuális futásban **figyelmen kívül hagyja** a `visited_users.txt` tartalmát
+  * a futás végén ettől függetlenül frissíti a `visited_users.txt`-t az újonnan feldolgozott userekkel
+
+- `--filterhu <0..1>`:
+  * opcionális magyar nyelvű tartalom szűrő
+  * például: `--filterhu 0.5`
+  * egy posztot/kommentet csak akkor tart meg, ha
+    ** `langdetect` szerint magyar valószínűség ≥ threshold **VAGY**
+    ** `phunspell` szerint a szavak elég nagy aránya helyes magyar szó
+
+== Példák
+
+=== Egyszerű letöltés egy userre
+
+[source,bash]
+----
+python main.py spez
+----
+
+=== Több felhasználó egy futásban
+
+[source,bash]
+Tegyük fel, hogy van egy `musers.txt`:
+
+[source]
+----
+# Magyar userek
+u/felhasznalo1
+felhasznalo2
+----
+
+Futtatás:
+
+[source,bash]
+----
+python main.py --inputfile musers.txt --sleep 0.1 --filterhu 0.5
+----
+
+=== Csak authentikáció tesztelése
+
+[source,bash]
+----
+python main.py --auth-test
+----
+
+== Letöltött fájlok formátuma
+
+Példa egy poszt blokkra (`*_posts.txt`):
+
+[source]
+----
+Post:
+  subreddit: r/pelda_sub
+  title: Valamilyen cím
+  body:
+    A poszt törzse
+    több sorban is lehet...
+----
+
+Példa egy komment blokkra (`*_chats.txt`):
+
+[source]
+----
+Comment:
+  subreddit: r/pelda_sub
+  body:
+    A komment szövege
+    szintén több sorban...
+----
+
+Sorvégeknél a kód a `\r` karaktereket eltávolítja, és a több soros szöveg soronként beljebb igazítva kerül bele a fájlba.
+
+== Megjegyzések, tippek
+
+- ajánlott futtatási parancs: python main.py --inputfile musers.txt --sleep 0.1 --filterhu 0.5
